@@ -1,0 +1,48 @@
+fixed:
+  OA: 40.0
+  AB: 35.0
+  BD: 25.0
+
+initial_design:
+  OO_prime: [10.0, 15.0]
+  AA_prime: [22.0, 8.0]
+  AB_prime: [5.0, -10.0]
+  BC_prime: [5.0, -8.0]
+
+search_bounds:
+  normalized_sigma0: 0.3
+  OO_prime:
+    lower: [-20.0, -35.0]
+    upper: [45.0, 45.0]
+  AA_prime:
+    lower: [-5.0, -25.0]
+    upper: [40.0, 25.0]
+  AB_prime:
+    lower: [-15.0, -35.0]
+    upper: [35.0, 35.0]
+  BC_prime:
+    lower: [-15.0, -35.0]
+    upper: [35.0, 35.0]
+
+clearance_diameters:
+  O: 19.0
+  O_prime: 10.0
+  A: 9.0
+  A_prime: 6.0
+  B: 6.0
+  B_prime: 6.0
+  C_prime: 6.0
+  D: 6.0
+
+clearance_rules:
+  - points: [A, B_prime]
+    gap: 0.5
+    scope: static
+
+  - points: [A, A_prime]
+    gap: 0.5
+    scope: static
+
+  - points: [B, C_prime]
+    gap: 0.5
+    scope: static
