@@ -16,7 +16,9 @@ import math
 from typing import Mapping, Sequence
 
 import numpy as np
+from scipy.optimize import OptimizeResult, minimize
 
+from finger.contact import CircleObject, ContactProblem, ContactSampleSet
 
 Array = np.ndarray
 
@@ -120,6 +122,15 @@ class TendonFingerState:
     equilibrium_residual_torque: Array
     spring_energy: float
     tendon_potential: float
+    contact_points: Array | None = None
+    contact_normals: Array | None = None
+    contact_link_ids: tuple[int, ...] = ()
+    contact_owner_names: tuple[str, ...] = ()
+    contact_margins: Array | None = None
+    max_penetration: float = 0.0
+    min_contact_margin: float = math.inf
+    optimization_success: bool = True
+    optimization_message: str = ""
 
     @property
     def absolute_angles(self) -> Array:
@@ -238,6 +249,89 @@ class TendonFinger:
         """Return the fingertip position for relative joint angles."""
         return self.forward_kinematics(q)[-1]
 
+    def link_sample_points(
+        self,
+        q: Sequence[float],
+        samples_per_link: int = 21,
+        link_ids: Sequence[int] = (0, 1, 2),
+    ) -> tuple[Array, Array, Array]:
+        """Sample centerline points on selected links.
+
+        Returns
+        -------
+        points:
+            ``(N, 2)`` sampled link-centerline points.
+        sampled_link_ids:
+            Integer link id for each sampled point.
+        fractions:
+            Local fraction from proximal joint to distal joint for each point.
+        """
+        if samples_per_link < 2:
+            raise ValueError("samples_per_link must be at least 2")
+
+        joints = self.forward_kinematics(q)
+        fractions_one = np.linspace(0.04, 0.96, int(samples_per_link))
+        points = []
+        sampled_link_ids = []
+        fractions = []
+        for link_id in link_ids:
+            link_idx = int(link_id)
+            if link_idx < 0 or link_idx >= 3:
+                raise IndexError(f"link id must be 0, 1, or 2, got {link_idx}")
+            start = joints[link_idx]
+            end = joints[link_idx + 1]
+            for fraction in fractions_one:
+                points.append(start + fraction * (end - start))
+                sampled_link_ids.append(link_idx)
+                fractions.append(float(fraction))
+        return (
+            np.asarray(points, dtype=float),
+            np.asarray(sampled_link_ids, dtype=int),
+            np.asarray(fractions, dtype=float),
+        )
+
+    def link_contact_sample_set(
+        self,
+        q: Sequence[float],
+        link_radius: float = 2.2,
+        samples_per_link: int = 21,
+        link_ids: Sequence[int] = (0, 1, 2),
+    ) -> ContactSampleSet:
+        """Return generic contact samples for the finger links."""
+        points, sampled_link_ids, fractions = self.link_sample_points(
+            q,
+            samples_per_link=samples_per_link,
+            link_ids=link_ids,
+        )
+        owner_names = tuple(f"link_{idx}" for idx in sampled_link_ids)
+        return ContactSampleSet(
+            points=points,
+            radii=np.full(len(points), float(link_radius), dtype=float),
+            owner_ids=sampled_link_ids,
+            owner_names=owner_names,
+            fractions=fractions,
+        )
+
+    def contact_problem_for_object(
+        self,
+        object_geom: CircleObject,
+        link_radius: float = 2.2,
+        samples_per_link: int = 27,
+        contact_link_ids: Sequence[int] = (0, 1, 2),
+        active_margin_tol: float = 0.35,
+    ) -> ContactProblem:
+        """Build a generic no-penetration contact problem for this finger."""
+        return ContactProblem(
+            object_geom=object_geom,
+            sample_fn=lambda q: self.link_contact_sample_set(
+                q,
+                link_radius=link_radius,
+                samples_per_link=samples_per_link,
+                link_ids=contact_link_ids,
+            ),
+            active_margin_tol=active_margin_tol,
+        )
+
     def tendon_torque(self, command: float) -> Array:
         """Torque applied by the tendon; negative means flexion in this convention."""
         return -float(command) * self.tendon_moment_arms
@@ -300,6 +394,11 @@ class TendonFinger:
         """Potential term whose gradient equals the tendon generalized force sign."""
         q_arr = _as_array3(q, "q")
         return float(command * np.dot(self.tendon_moment_arms, q_arr))
+
+    def potential_gradient(self, q: Sequence[float], command: float) -> Array:
+        """Gradient of spring energy plus tendon potential."""
+        q_arr = _as_array3(q, "q")
+        return self.spring_stiffness * (q_arr - self.rest_angles) + float(command) * self.tendon_moment_arms
 
     def solve(
         self,
@@ -366,6 +465,156 @@ class TendonFinger:
             spring_energy=self.spring_energy(q),
             tendon_potential=self.tendon_potential(q, command),
         )
+
+    def solve_with_contact_problem(
+        self,
+        command: float,
+        contact_problem: ContactProblem,
+        q_init: Sequence[float] | None = None,
+    ) -> TendonFingerState:
+        """Solve tendon equilibrium with a generic no-penetration problem.
+
+        The tendon command remains scalar. Contact adaptivity enters only
+        through no-penetration margins produced by ``contact_problem``.
+        """
+        command = float(command)
+        if command < 0.0:
+            raise ValueError(f"command must be nonnegative, got {command}")
+
+        bounds = tuple(zip(self.min_angles, self.max_angles))
+
+        def objective(q: Array) -> float:
+            return self.spring_energy(q) + self.tendon_potential(q, command)
+
+        def constraint_margin(q: Array) -> Array:
+            return contact_problem.margins(q)
+
+        constraints = ({"type": "ineq", "fun": constraint_margin},)
+
+        if q_init is not None:
+            starts = [np.clip(_as_array3(q_init, "q_init"), self.min_angles, self.max_angles)]
+        else:
+            free_q = self.free_equilibrium(command)
+            starts = [
+                free_q,
+                self.rest_angles.copy(),
+                0.5 * (free_q + self.rest_angles),
+            ]
+
+        best_res: OptimizeResult | None = None
+        best_score = math.inf
+        for start in starts:
+            res = minimize(
+                objective,
+                start,
+                jac=lambda q: self.potential_gradient(q, command),
+                bounds=bounds,
+                constraints=constraints,
+                method="SLSQP",
+                options={"ftol": 1e-8, "maxiter": 120, "disp": False},
+            )
+            margin = constraint_margin(res.x)
+            penetration = float(np.max(np.maximum(0.0, -margin)))
+            score = penetration * 1e6 + objective(res.x)
+            if bool(res.success) and penetration <= 1e-5:
+                score -= 1e5
+            if score < best_score:
+                best_score = score
+                best_res = res
+
+        if best_res is None:
+            raise RuntimeError("Object-constrained solve did not run")
+
+        q = np.clip(_as_array3(best_res.x, "q"), self.min_angles, self.max_angles)
+        joints = self.forward_kinematics(q)
+        spring_torque = self.spring_torque(q)
+        tendon_torque = self.tendon_torque(command)
+        net_joint_torque = spring_torque + tendon_torque
+
+        sample_set = contact_problem.sample_set(q)
+        margins = sample_set.margins(contact_problem.object_geom)
+        penetration = np.maximum(0.0, -margins)
+        active_contacts = contact_problem.active_contacts(q)
+
+        active_by_link = tuple(bool(np.any(active_contacts.owner_ids == idx)) for idx in range(3))
+        contact_reaction_torque = self.contact_reaction_torque(q, command, active_by_link)
+        joint_limit_reaction_torque = self.joint_limit_reaction_torque(q, command, active_by_link)
+        equilibrium_residual_torque = (
+            net_joint_torque
+            + contact_reaction_torque
+            + joint_limit_reaction_torque
+        )
+
+        return TendonFingerState(
+            command=command,
+            q=q,
+            locked=active_by_link,
+            joint_positions=joints,
+            spring_torque=spring_torque,
+            tendon_torque=tendon_torque,
+            net_joint_torque=net_joint_torque,
+            contact_reaction_torque=contact_reaction_torque,
+            joint_limit_reaction_torque=joint_limit_reaction_torque,
+            equilibrium_residual_torque=equilibrium_residual_torque,
+            spring_energy=self.spring_energy(q),
+            tendon_potential=self.tendon_potential(q, command),
+            contact_points=active_contacts.points,
+            contact_normals=active_contacts.normals,
+            contact_link_ids=tuple(int(v) for v in active_contacts.owner_ids),
+            contact_owner_names=active_contacts.owner_names,
+            contact_margins=active_contacts.margins,
+            max_penetration=float(np.max(penetration)) if len(penetration) else 0.0,
+            min_contact_margin=float(np.min(margins)) if len(margins) else math.inf,
+            optimization_success=bool(best_res.success) and float(np.max(penetration)) <= 1e-4,
+            optimization_message=str(best_res.message),
+        )
+
+    def solve_with_object(
+        self,
+        command: float,
+        object_geom: CircleObject,
+        q_init: Sequence[float] | None = None,
+        link_radius: float = 2.2,
+        samples_per_link: int = 27,
+        contact_link_ids: Sequence[int] = (0, 1, 2),
+        active_margin_tol: float = 0.35,
+    ) -> TendonFingerState:
+        """Compatibility wrapper using generic sampled-link contact."""
+        problem = self.contact_problem_for_object(
+            object_geom,
+            link_radius=link_radius,
+            samples_per_link=samples_per_link,
+            contact_link_ids=contact_link_ids,
+            active_margin_tol=active_margin_tol,
+        )
+        return self.solve_with_contact_problem(command, problem, q_init=q_init)
+
+    def solve_many_with_object(
+        self,
+        commands: Sequence[float],
+        object_geom: CircleObject,
+        q_init: Sequence[float] | None = None,
+        link_radius: float = 2.2,
+        samples_per_link: int = 27,
+        contact_link_ids: Sequence[int] = (0, 1, 2),
+        active_margin_tol: float = 0.35,
+    ) -> TendonFingerTrajectory:
+        """Solve a command sweep with one fixed object using continuation."""
+        states = []
+        q_prev = None if q_init is None else _as_array3(q_init, "q_init")
+        for command in np.asarray(commands, dtype=float).reshape(-1):
+            state = self.solve_with_object(
+                float(command),
+                object_geom,
+                q_init=q_prev,
+                link_radius=link_radius,
+                samples_per_link=samples_per_link,
+                contact_link_ids=contact_link_ids,
+                active_margin_tol=active_margin_tol,
+            )
+            states.append(state)
+            q_prev = state.q
+        return TendonFingerTrajectory(tuple(states))
 
     def solve_many(
         self,

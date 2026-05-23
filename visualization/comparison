@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Visualization of tendon-driven underactuated adaptive grasping.
 
-The deterministic linkage finger keeps a prescribed gross pose. This script is
-the comparison figure for a conventional tendon finger: one tendon command is
-redistributed by torsional springs, and object contact locks whichever joint is
-blocked by the object.
+The comparison figure for a conventional tendon finger: one tendon command is
+redistributed by torsional springs, while object contact is modeled as a
+no-penetration constraint on the serial finger geometry.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
+from finger.contact import ActiveContacts, CircleObject, sample_segment
 from finger.tendon_finger import TendonFinger, TendonFingerConfig, TendonFingerState
 
 
@@ -41,15 +41,20 @@ CONTACT_COLOR = "#c62828"
 OBJECT_FACE = "#d9d9d9"
 OBJECT_EDGE = "#555555"
 JOINT_LABELS = (r"$J_0$", r"$J_1$", r"$J_2$", r"$EE$")
+OBJECT_RADIUS = 7.0
+LINK_RADIUS = 2.2
+PANEL_XLIM = (-45.0, 105.0)
+PANEL_YLIM = (-75.0, 8.0)
+PALM_START = np.array([0.0, 0.0], dtype=float)
+PALM_END = np.array([-32.0, -10.0], dtype=float)
 
 
 @dataclass(frozen=True)
 class ObjectCase:
     name: str
     panel_label: str
-    contact_commands: dict[str, float]
-    contact_specs: tuple[tuple[str, float], ...]
-    radius: float = 8.0
+    object_center: tuple[float, float]
+    radius: float = OBJECT_RADIUS
     final_command: float = 1.25
 
 
@@ -57,23 +62,20 @@ CASES = (
     ObjectCase(
         name="proximal-middle object",
         panel_label="(a)",
-        contact_commands={"mcp": 0.36, "pip": 0.62},
-        contact_specs=(("mcp", 0.92), ("pip", 0.06)),
-        radius=7.5,
+        object_center=(34.730608, -10.795296),
+        final_command=0.95,
     ),
     ObjectCase(
         name="middle-distal object",
         panel_label="(b)",
-        contact_commands={"pip": 0.48, "dip": 0.82},
-        contact_specs=(("pip", 0.84), ("dip", 0.10)),
-        radius=6.0,
+        object_center=(37.686544, -43.484382),
+        final_command=1.10,
     ),
     ObjectCase(
-        name="distal-side object",
+        name="palm-proximal object",
         panel_label="(c)",
-        contact_commands={"pip": 0.70, "dip": 0.96},
-        contact_specs=(("pip", 0.86), ("dip", 0.24)),
-        radius=6.8,
+        object_center=(-2.904075, -8.241360),
+        final_command=0.40,
     ),
 )
 
@@ -108,61 +110,24 @@ def unit(v: np.ndarray) -> np.ndarray:
     return v / norm
 
 
-def palmar_normal(start: np.ndarray, end: np.ndarray) -> np.ndarray:
-    """Normal pointing toward the grasp interior for the chosen flexion sign."""
-    tangent = unit(end - start)
-    return np.array([tangent[1], -tangent[0]])
+def palm_contact_normal() -> np.ndarray:
+    """Palm-side normal for placing the object under the slanted palm."""
+    tangent = unit(PALM_END - PALM_START)
+    return np.array([-tangent[1], tangent[0]])
 
 
-def joint_index(joint_name: str) -> int:
-    return {"mcp": 0, "pip": 1, "dip": 2}[joint_name]
+def palm_segment() -> np.ndarray:
+    return np.vstack((PALM_START, PALM_END))
 
 
-def contact_points_and_normals(state: TendonFingerState, case: ObjectCase) -> tuple[np.ndarray, np.ndarray]:
-    contacts = []
-    normals = []
-    for joint_name, fraction in case.contact_specs:
-        idx = joint_index(joint_name)
-        start = state.joint_positions[idx]
-        end = state.joint_positions[idx + 1]
-        contacts.append(start + fraction * (end - start))
-        normals.append(palmar_normal(start, end))
-    return np.asarray(contacts, dtype=float), np.asarray(normals, dtype=float)
+def object_for_case(finger: TendonFinger, case: ObjectCase) -> CircleObject:
+    return CircleObject(center=case.object_center, radius=case.radius)
 
 
-def circle_center_from_contacts(
-    contacts: np.ndarray,
-    normals: np.ndarray,
-    requested_radius: float,
-) -> tuple[np.ndarray, float]:
-    """Choose a circle tangent to the local palmar contact normals."""
-    if len(contacts) < 2:
-        radius = requested_radius
-        return contacts[0] + normals[0] * radius, radius
-
-    rows = []
-    rhs = []
-    for contact, normal in zip(contacts, normals):
-        rows.append([1.0, 0.0, -normal[0]])
-        rhs.append(contact[0])
-        rows.append([0.0, 1.0, -normal[1]])
-        rhs.append(contact[1])
-
-    solution, *_unused = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
-    center = solution[:2]
-    radius = float(solution[2])
-    if not np.isfinite(radius) or radius <= 1.0:
-        radius = float(requested_radius)
-        center = np.mean(contacts + radius * normals, axis=0)
-    return center, radius
-
-
-def draw_object(ax, state: TendonFingerState, case: ObjectCase) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    contacts, normals = contact_points_and_normals(state, case)
-    center, radius = circle_center_from_contacts(contacts, normals, case.radius)
+def draw_object(ax, object_geom: CircleObject) -> tuple[np.ndarray, float]:
     patch = Circle(
-        center,
-        radius,
+        object_geom.center,
+        object_geom.radius,
         facecolor=OBJECT_FACE,
         edgecolor=OBJECT_EDGE,
         linewidth=0.9,
@@ -171,24 +136,15 @@ def draw_object(ax, state: TendonFingerState, case: ObjectCase) -> tuple[np.ndar
     )
     ax.add_patch(patch)
     ax.scatter(
-        [center[0]],
-        [center[1]],
+        [object_geom.center[0]],
+        [object_geom.center[1]],
         s=13,
         facecolor="white",
         edgecolor=OBJECT_EDGE,
         linewidth=0.65,
         zorder=3,
     )
-    ax.plot(
-        [center[0], contacts[0, 0]],
-        [center[1], contacts[0, 1]],
-        color=OBJECT_EDGE,
-        linewidth=0.65,
-        alpha=0.55,
-        linestyle=":",
-        zorder=3,
-    )
-    return contacts, normals, center, radius
+    return object_geom.center, object_geom.radius
 
 
 def draw_torsion_spring(ax, center: np.ndarray, radius: float = 2.25) -> None:
@@ -310,19 +266,159 @@ def draw_initial_finger(ax, finger: TendonFinger) -> None:
     )
 
 
+def draw_palm(ax) -> None:
+    palm = palm_segment()
+    tangent = unit(PALM_END - PALM_START)
+    normal = palm_contact_normal()
+    ax.plot(
+        palm[:, 0],
+        palm[:, 1],
+        color="#5f5f5f",
+        linewidth=2.0,
+        solid_capstyle="butt",
+        zorder=3.5,
+    )
+    ax.plot(
+        palm[:, 0],
+        palm[:, 1],
+        color="#bdbdbd",
+        linewidth=4.6,
+        alpha=0.35,
+        solid_capstyle="butt",
+        zorder=3.4,
+    )
+    for fraction in np.linspace(0.12, 0.88, 6):
+        point = PALM_START + fraction * (PALM_END - PALM_START)
+        hatch_start = point + 2.4 * normal - 0.9 * tangent
+        hatch_end = point + 0.35 * normal + 0.9 * tangent
+        ax.plot(
+            [hatch_start[0], hatch_end[0]],
+            [hatch_start[1], hatch_end[1]],
+            color="#777777",
+            linewidth=0.65,
+            alpha=0.78,
+            zorder=3.3,
+        )
+    label_position = 0.55 * PALM_END + 3.5 * normal
+    ax.text(
+        label_position[0],
+        label_position[1],
+        "palm",
+        fontsize=7.2,
+        color="#555555",
+        zorder=12,
+    )
+
+
+def state_active_contacts(state: TendonFingerState) -> ActiveContacts:
+    """Convert solver contact samples into the generic active-contact container."""
+    if state.contact_points is None or state.contact_normals is None or len(state.contact_link_ids) == 0:
+        return ActiveContacts.empty()
+
+    points = np.asarray(state.contact_points, dtype=float).reshape(-1, 2)
+    normals = np.asarray(state.contact_normals, dtype=float).reshape(-1, 2)
+    owner_ids = np.asarray(state.contact_link_ids, dtype=int)
+    owner_names = (
+        state.contact_owner_names
+        if len(state.contact_owner_names) == len(owner_ids)
+        else tuple(f"link_{idx}" for idx in owner_ids)
+    )
+    margins = (
+        np.asarray(state.contact_margins, dtype=float).reshape(-1)
+        if state.contact_margins is not None
+        else np.zeros(len(points), dtype=float)
+    )
+    return ActiveContacts(
+        points=points,
+        normals=normals,
+        owner_ids=owner_ids,
+        owner_names=owner_names,
+        margins=margins,
+        source_points=points,
+        source_radii=np.full(len(points), LINK_RADIUS, dtype=float),
+    )
+
+
+def palm_active_contacts(object_geom: CircleObject) -> ActiveContacts:
+    """Detect static palm contacts with the same generic sample framework."""
+    palm_samples = sample_segment(
+        PALM_START,
+        PALM_END,
+        radius=0.0,
+        owner_id=-1,
+        owner_name="palm",
+        samples=31,
+        endpoint_margin=0.02,
+    )
+    return palm_samples.active_contacts(object_geom, margin_tol=0.35).representatives_by_owner()
+
+
+def select_visual_contacts(
+    finger_contacts: ActiveContacts,
+    palm_contacts: ActiveContacts,
+    max_points: int = 3,
+) -> ActiveContacts:
+    """Prefer distinct owners, then fill a 3-contact patch by closest samples."""
+    selected = finger_contacts.representatives_by_owner().append(palm_contacts.representatives_by_owner())
+    if len(selected.points) >= max_points or len(finger_contacts.points) == 0:
+        if len(selected.points) <= max_points:
+            return selected
+        keep = np.argsort(selected.margins)[:max_points]
+        return ActiveContacts(
+            points=selected.points[keep],
+            normals=selected.normals[keep],
+            owner_ids=selected.owner_ids[keep],
+            owner_names=tuple(np.asarray(selected.owner_names, dtype=object)[keep]),
+            margins=selected.margins[keep],
+            source_points=selected.source_points[keep],
+            source_radii=selected.source_radii[keep],
+        )
+
+    existing = set(zip(selected.owner_ids.tolist(), selected.owner_names))
+    extra_indices = []
+    for idx in np.argsort(finger_contacts.margins):
+        key = (int(finger_contacts.owner_ids[idx]), finger_contacts.owner_names[idx])
+        duplicate_point = (
+            len(selected.points) > 0
+            and np.min(np.linalg.norm(selected.points - finger_contacts.points[idx][None, :], axis=1)) < 1e-6
+        )
+        if duplicate_point:
+            continue
+        if key in existing and len(selected.points) + len(extra_indices) < max_points:
+            extra_indices.append(int(idx))
+        if len(selected.points) + len(extra_indices) >= max_points:
+            break
+    if not extra_indices:
+        return selected
+    extra = ActiveContacts(
+        points=finger_contacts.points[extra_indices],
+        normals=finger_contacts.normals[extra_indices],
+        owner_ids=finger_contacts.owner_ids[extra_indices],
+        owner_names=tuple(np.asarray(finger_contacts.owner_names, dtype=object)[extra_indices]),
+        margins=finger_contacts.margins[extra_indices],
+        source_points=finger_contacts.source_points[extra_indices],
+        source_radii=finger_contacts.source_radii[extra_indices],
+    )
+    return selected.append(extra)
+
+
 def draw_contacts(ax, contacts: np.ndarray, normals: np.ndarray) -> None:
+    """Draw object reaction forces acting on the contacted finger links."""
+    if len(contacts) == 0:
+        return
     ax.scatter(
         contacts[:, 0],
         contacts[:, 1],
-        s=31,
+        s=25,
         facecolor=CONTACT_COLOR,
         edgecolor="white",
         linewidth=0.75,
         zorder=9,
     )
-    for contact, normal in zip(contacts, normals):
-        start = contact + 0.45 * normal
-        end = contact - 2.7 * normal
+    for idx, (contact, normal) in enumerate(zip(contacts, normals)):
+        reaction = unit(normal)
+        start = contact - 0.70 * reaction
+        end = contact + 4.0 * reaction
         ax.annotate(
             "",
             xy=end,
@@ -330,7 +426,8 @@ def draw_contacts(ax, contacts: np.ndarray, normals: np.ndarray) -> None:
             arrowprops={
                 "arrowstyle": "-|>",
                 "color": CONTACT_COLOR,
-                "lw": 0.8,
+                "lw": 1.15,
+                "mutation_scale": 8.5,
                 "shrinkA": 0,
                 "shrinkB": 0,
             },
@@ -340,20 +437,9 @@ def draw_contacts(ax, contacts: np.ndarray, normals: np.ndarray) -> None:
 
 def apply_panel_axes(ax, point_sets: list[np.ndarray], circles: list[tuple[np.ndarray, float]]) -> None:
     """Set padded limits and a light Matplotlib-style grid."""
-    points = [np.asarray(points, dtype=float).reshape(-1, 2) for points in point_sets if len(points)]
-    for center, radius in circles:
-        center = np.asarray(center, dtype=float)
-        points.append(np.vstack((center - radius, center + radius)))
-
-    all_points = np.vstack(points)
-    xy_min = np.min(all_points, axis=0)
-    xy_max = np.max(all_points, axis=0)
-    span = np.maximum(xy_max - xy_min, np.array([1.0, 1.0]))
-    margin = np.maximum(0.11 * span, np.array([6.0, 6.0]))
-
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlim(float(xy_min[0] - margin[0]), float(xy_max[0] + margin[0]))
-    ax.set_ylim(float(xy_min[1] - margin[1]), float(xy_max[1] + margin[1]))
+    ax.set_xlim(*PANEL_XLIM)
+    ax.set_ylim(*PANEL_YLIM)
     ax.set_axisbelow(True)
     ax.grid(True, color="#d9d9d9", linewidth=0.55, alpha=0.85)
     ax.tick_params(axis="both", labelsize=7, direction="in", width=0.55, length=2.8)
@@ -365,20 +451,30 @@ def apply_panel_axes(ax, point_sets: list[np.ndarray], circles: list[tuple[np.nd
 
 
 def draw_case_panel(ax, finger: TendonFinger, case: ObjectCase) -> dict[str, float | str]:
-    commands = np.linspace(0.0, case.final_command, 150)
+    commands = np.linspace(0.0, case.final_command, 86)
     free_traj = finger.solve_many(commands)
-    contact_traj = finger.simulate_contact_sequence(commands, case.contact_commands)
+    object_geom = object_for_case(finger, case)
+    contact_traj = finger.solve_many_with_object(
+        commands,
+        object_geom,
+        link_radius=LINK_RADIUS,
+        samples_per_link=19,
+        active_margin_tol=1.05,
+    )
     final_state = contact_traj.states[-1]
 
     draw_initial_finger(ax, finger)
     draw_end_effector_trajectory(ax, free_traj.tips, contact_traj.tips)
+    draw_palm(ax)
 
-    contacts, normals, object_center, object_radius = draw_object(ax, final_state, case)
+    object_center, object_radius = draw_object(ax, object_geom)
     draw_finger(ax, final_state)
-    draw_contacts(ax, contacts, normals)
+    finger_contacts = state_active_contacts(final_state)
+    palm_contacts = palm_active_contacts(object_geom)
+    visual_contacts = select_visual_contacts(finger_contacts, palm_contacts, max_points=3)
+    draw_contacts(ax, visual_contacts.points, visual_contacts.normals)
 
     q_deg = np.rad2deg(final_state.q)
-    active = ", ".join(name.upper() for name in final_state.active_contact_joints) or "none"
     ax.text(
         0.02,
         0.98,
@@ -390,18 +486,6 @@ def draw_case_panel(ax, finger: TendonFinger, case: ObjectCase) -> dict[str, flo
         fontsize=9.5,
         zorder=20,
     )
-    ax.text(
-        0.02,
-        0.07,
-        f"locked: {active}\n"
-        f"q = [{q_deg[0]:.0f}, {q_deg[1]:.0f}, {q_deg[2]:.0f}] deg",
-        transform=ax.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=8.4,
-        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#d0d0d0", "alpha": 0.88},
-        zorder=20,
-    )
 
     apply_panel_axes(
         ax,
@@ -410,7 +494,8 @@ def draw_case_panel(ax, finger: TendonFinger, case: ObjectCase) -> dict[str, flo
             final_state.joint_positions,
             free_traj.tips,
             contact_traj.tips,
-            contacts,
+            visual_contacts.points,
+            palm_segment(),
         ],
         [(object_center, object_radius)],
     )
@@ -419,19 +504,21 @@ def draw_case_panel(ax, finger: TendonFinger, case: ObjectCase) -> dict[str, flo
         "case": case.name,
         "object_kind": "circle",
         "object_radius": object_radius,
-        "contact_joints": " ".join(joint_name for joint_name, _fraction in case.contact_specs),
-        "contact_point_count": len(case.contact_specs),
-        "locked_joints": " ".join(final_state.active_contact_joints),
+        "object_center_x": object_center[0],
+        "object_center_y": object_center[1],
+        "visual_contact_point_count": len(visual_contacts.points),
+        "active_contact_owners": " ".join(visual_contacts.owner_names),
+        "solver_contact_owners": " ".join(finger_contacts.representatives_by_owner().owner_names),
         "final_command": final_state.command,
         "q_mcp_deg": q_deg[0],
         "q_pip_deg": q_deg[1],
         "q_dip_deg": q_deg[2],
         "spring_energy": final_state.spring_energy,
         "tendon_potential": final_state.tendon_potential,
-        "contact_reaction_mcp": final_state.contact_reaction_torque[0],
-        "contact_reaction_pip": final_state.contact_reaction_torque[1],
-        "contact_reaction_dip": final_state.contact_reaction_torque[2],
-        "max_abs_equilibrium_residual_torque": final_state.max_abs_equilibrium_residual_torque,
+        "max_penetration": final_state.max_penetration,
+        "min_contact_margin": final_state.min_contact_margin,
+        "optimization_success": str(final_state.optimization_success),
+        "optimization_message": final_state.optimization_message,
         "tip_x": final_state.tip[0],
         "tip_y": final_state.tip[1],
     }
